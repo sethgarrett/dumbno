@@ -1,4 +1,4 @@
-This version adds the following to the master:
+This version adds the following to the ncsa:master:
 1) RabbitMQ 
 ----Requires RabbitMQ to be installed.  See .cfg and receiver examples for queue,host, and port mapping.
 ----Makes the process handle shunts coming in at a higher rate
