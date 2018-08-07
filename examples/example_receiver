@@ -1,0 +1,6 @@
+receiver.py DUMBNO-QUEUE-NAME localhost 9000
+
+DUMBNO-QUEUE-NAME and localhost needs to match whats in your .cfg file
+port 9000 will be what the reeciver lists on for updates from Bro.  Set Bro to 9000 as well.
+
+You can change the port to support multiple Bro instances sending to the same Dumbno host.  Just use a different port # and queuename for the second Bro instance.

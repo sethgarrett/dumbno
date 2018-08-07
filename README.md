@@ -1,3 +1,15 @@
+This version adds the following to the master:
+1) RabbitMQ 
+----Requires RabbitMQ to be installed.  See .cfg and receiver examples for queue,host, and port mapping.
+----Makes the process handle shunts coming in at a higher rate
+----You will need to install RabbitMQ prior to this working.
+2) Updates are batched
+----Updating the ACL per line is slower than feeding a larger batch of lines at once.
+----It will wait for 100 lines or 5 seconds.
+----The fewer ACLs you have to update the quicker this is as well.
+3) Lowered limit of rules
+----I found the Arista 9504 to max out around 7100 acl lines.
+----When the limit is hit, dumbno will stop adding lines until some have aged out
 
 
 No elephant flows!

@@ -1,3 +1,5 @@
+#!/usr/bin/python
+
 from jsonrpclib import Server, history as jsonrpclib_history
 import socket
 import time
@@ -7,6 +9,13 @@ import logging
 import logging.handlers
 import ConfigParser
 from collections import namedtuple
+import pika
+
+newrun = 1
+addcmds = []
+addrulesprep = []
+bulkcount = 0
+
 
 class InvalidRequest(Exception):
     pass
@@ -58,11 +67,12 @@ def make_rule(s=None, d=None, proto="ip", sp=None, dp=None):
 ACL = namedtuple("ACL", "name family")
 
 class AristaACLManager:
-    def __init__(self, scheme, ip, user, password, ports, egress_ports, logger, two_tuple_hosts):
+    def __init__(self, scheme, ip, user, password, ports, egress_ports, logger, two_tuple_hosts, queueserver, queuename):
         self.uri = "%s://%s:%s@%s/command-api" % (scheme, user, password, ip)
         self.ports = ports
         self.egress_ports = egress_ports
         self.two_tuple_hosts = two_tuple_hosts or set()
+        self.last_push = 0
 
         # Enable V6
         self.acls = {}
@@ -77,8 +87,8 @@ class AristaACLManager:
                     self.acls_by_family[family].append(new_acl)
 
         self.logger = logger
-        self.min = 500
-        self.max = 100000
+        self.min = 1000
+        self.max = 24000
         self.seq = self.min + 1
         self.switch = Server( self.uri)
 
@@ -166,7 +176,7 @@ class AristaACLManager:
 
             seqs  = set(x["sequenceNumber"] for x in acls)
             rules = set(x["text"] for x in acls)
-
+            
             self.all_seqs.update(seqs)
             self.all_rules.update(rules)
 
@@ -189,7 +199,8 @@ class AristaACLManager:
             if x % 2 == 0: continue #i want an odd number
             if x not in self.all_seqs:
                 return x
-        raise Exception("Too many ACLS?")
+        self.logger.info('No free ACL sequence numbers found. Possible ACL Limit reached!')
+        raise Exception('ACL FULL!')
 
     def modify_record(self, record):
         tt = self.two_tuple_hosts
@@ -199,8 +210,12 @@ class AristaACLManager:
 
     def add_acl(self, src=None, dst=None, proto="ip", sport=None, dport=None):
         rule = make_rule(src, dst, proto, sport, dport)
-
+        global addcmds
+        global newrun
+        global bulkcount
+        global addrulesprep
         if rule in self.all_rules:
+            #print 'EXISTS!!!' + rule
             return False
 
         cmdfamily = 'ip'
@@ -209,24 +224,38 @@ class AristaACLManager:
         elif proto in ('ip', 'ipv6'):
             cmdfamily = proto
 
-        cmds = [
-            "enable",
-            "configure",
-        ]
-
-        self.seq = self.calc_next()
-
-
-        for acl in self.acls_by_family[cmdfamily]:
-            cmds.extend([
-                "%s access-list %s" % (acl.family, acl.name),
-                "%d deny %s" % (self.seq, rule),
-            ])
-
-        self.logger.info("op=ADD seq=%s rule=%r" % (self.seq, rule))
-        response = self.switch.runCmds(version=1, cmds=cmds, format='text')
-        self.all_rules.add(rule)
+        if newrun ==1 :
+            addcmds = [
+                "enable",
+                "configure",
+            ]
+        try:
+            self.seq = self.calc_next()
+        except:
+            newrun = 1
+            return False
+        addrulesprep.append("%d deny %s" % (self.seq, rule))
         self.all_seqs.add(self.seq)
+        self.all_rules.add(rule)
+        self.logger.info("op=ADD seq=%s rule=%r" % (self.seq, rule))
+
+                
+        if bulkcount == 100 or time.time() - self.last_push > 5 and len(addrulesprep) > 2:
+            for acl in self.acls_by_family[cmdfamily]:
+                addcmds.append("%s access-list %s" % (acl.family, acl.name))
+                for ruleitem in addrulesprep:
+                    addcmds.append(ruleitem)
+            self.logger.info('ACL Push')
+            self.logger.info('ACL Entries:' + str(len(self.all_seqs)))
+            response = self.switch.runCmds(version=1, cmds=addcmds, format='text')
+            newrun = 1
+            bulkcount = 0
+            addrulesprep = []
+            self.last_push = time.time()
+        else:
+            newrun = 0
+            bulkcount = bulkcount + 1
+
         return True
 
     def remove_acls(self, to_remove):
@@ -341,40 +370,43 @@ DEFAULT_BACKEND = 'arista'
 class ACLSvr:
     def __init__(self, mgr):
         self.mgr = mgr
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(('', 9000))
-        self.sock.settimeout(5)
-        self.sock.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1024)
         self.last_check = 0
-
+        
     def check(self):
-        if time.time() - self.last_check > 30:
+        if time.time() - self.last_check > 120 and newrun == 1:
             self.mgr.remove_expired()
             self.last_check = time.time()
+    def callback(self,ch, method, properties, body):
+        jsonrpclib_history.clear()
+        self.check()
+        sys.stdout.flush()
+        record = json.loads(body)
+        record = self.mgr.modify_record(record)
+        try:
+            self.mgr.add_acl(**record)
+            ch.basic_ack(delivery_tag = method.delivery_tag)
+        except InvalidRequest as e:
+            self.mgr.logger.exception("Invalid request")
+            ch.basic_ack(delivery_tag = method.delivery_tag)
+        
+    def run(self, config):
+	self.mgr.logger.info("Ready..")
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=config["queueserver"]))
+        channel = connection.channel()
+        channel.basic_qos(prefetch_count=100)
+        channel.queue_declare(queue=config["queuename"])
+        channel.basic_consume(self.callback,
+                      queue=config["queuename"],
+                      no_ack=False)
+        channel.start_consuming()
 
-    def run(self):
-        self.mgr.logger.info("Ready..")
-        while True:
-            jsonrpclib_history.clear()
-            self.check()
-            sys.stdout.flush()
 
-            try :
-                data, addr = self.sock.recvfrom(1024)
-            except socket.timeout:
-                continue
 
-            record = json.loads(data)
-            record = self.mgr.modify_record(record)
-            try:
-                self.mgr.add_acl(**record)
-                self.sock.sendto("ok", addr)
-            except InvalidRequest as e:
-                self.mgr.logger.exception("Invalid request")
-                self.sock.sendto("error: %s" % e, addr)
+
+
 
 class ACLClient:
-    def __init__(self, host, port=9000):
+    def __init__(self, host, port=9001):
         self.addr = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(1)
@@ -407,14 +439,16 @@ def read_config(cfg_file):
 
     return config
 
-def get_logger(name="dumbno"):
+def get_logger(config):
+    name = config["queuename"]
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(name)
     formatter = logging.Formatter('%(name)s: %(levelname)s %(message)s')
-    handler = logging.handlers.SysLogHandler()#address='/dev/log')
+    handler = logging.handlers.SysLogHandler(address='/dev/log')#address='/dev/log')
     handler.setFormatter(formatter)
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
+    logger.propagate = False
     return logger
 
 
@@ -428,14 +462,14 @@ def get_backend(logger, config):
     return backend_class(logger=logger, **config)
 
 def launch(config, setup=False):
-    logger = get_logger()
+    logger = get_logger(config)
     logger.info("Started")
     mgr = get_backend(logger, config)
     if setup:
         mgr.setup()
 
     svr = ACLSvr(mgr)
-    svr.run()
+    svr.run(config)
 
 def run_stats(config, setup=False):
     logger = get_logger("dumbno_stats")
@@ -457,4 +491,8 @@ def main():
         launch(config, setup=setup)
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print e
